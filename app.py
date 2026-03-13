@@ -11,6 +11,8 @@ from docx import Document
 import PyPDF2
 from datetime import datetime
 import io
+import zipfile
+import tempfile
 
 # --- Page Settings (MUST be first Streamlit command) ---
 st.set_page_config(page_title="Group 4 | Resume AI", page_icon="🧠", layout="wide")
@@ -163,18 +165,50 @@ def extract_education(text):
             found.append(degree)
     return ", ".join(found) if found else "Not Found"
 
-def extract_skills(text):
-    skill_list = [
-        'Python', 'Java', 'SQL', 'JavaScript', 'React', 'Node', 'HTML', 'CSS',
-        'Machine Learning', 'Deep Learning', 'NLP', 'TensorFlow', 'Keras',
-        'Pandas', 'NumPy', 'Scikit-learn', 'Git', 'Docker', 'AWS', 'Azure',
-        'Workday', 'PeopleSoft', 'SAP', 'Oracle', 'MySQL', 'MongoDB',
-        'Power BI', 'Tableau', 'Excel', 'C++', 'C#', 'Linux', 'Agile', 'Scrum',
-        'REST API', 'Spring Boot', 'Django', 'Flask', 'Selenium', 'Postman'
-    ]
+# All skills organized by category — used for display in candidate profile
+ALL_SKILLS = {
+    # --- SQL Developer Skills ---
+    "SQL Developer": [
+        'SQL', 'MySQL', 'Oracle', 'MongoDB', 'PostgreSQL', 'SSMS',
+        'Stored Procedure', 'NoSQL', 'ETL', 'Data Warehouse',
+        'Power BI', 'Tableau', 'Excel', 'Python', 'Azure',
+        'AWS', 'Linux', 'Git', 'Agile', 'Query'
+    ],
+    # --- React Developer Skills ---
+    "React Developer": [
+        'React', 'JavaScript', 'HTML', 'CSS', 'Node', 'Redux',
+        'TypeScript', 'REST API', 'JSON', 'npm', 'Git', 'Docker',
+        'AWS', 'Azure', 'Python', 'Agile', 'Scrum',
+        'Jest', 'Webpack', 'Bootstrap'
+    ],
+    # --- Workday Skills ---
+    "Workday": [
+        'Workday', 'HCM', 'HRIS', 'Payroll', 'ERP',
+        'Business Process', 'Workday Studio', 'Integration', 'BIRT', 'Absence',
+        'SAP', 'Oracle', 'PeopleSoft', 'Excel', 'SQL',
+        'Python', 'Agile', 'Reporting', 'Compensation', 'Recruiting'
+    ],
+    # --- Peoplesoft Skills ---
+    "Peoplesoft": [
+        'PeopleSoft', 'PeopleCode', 'Application Engine', 'SQR', 'Component Interface',
+        'HCM', 'FSCM', 'ERP', 'Integration Broker', 'PeopleSoft Query',
+        'Oracle', 'SQL', 'Workday', 'SAP', 'Excel',
+        'Python', 'Agile', 'COBOL', 'Unix', 'Reporting'
+    ],
+}
+
+# Flat list of all unique skills for general extraction
+_ALL_SKILLS_FLAT = list({skill for skills in ALL_SKILLS.values() for skill in skills})
+
+def extract_skills(text, category=None):
+    # If category is known, use category-specific skill list for more accurate extraction
+    if category and category in ALL_SKILLS:
+        skill_list = ALL_SKILLS[category]
+    else:
+        skill_list = _ALL_SKILLS_FLAT
     found = []
     for skill in skill_list:
-        if re.search(skill, text, re.IGNORECASE):
+        if re.search(re.escape(skill), text, re.IGNORECASE):
             found.append(skill)
     return found
 
@@ -200,7 +234,7 @@ def analyze_resume(raw_text, file_name):
     phone     = extract_phone(raw_text)
     experience= extract_experience(raw_text)
     education = extract_education(raw_text)
-    skills    = extract_skills(raw_text)
+    skills    = extract_skills(raw_text, category)   # category-specific skill extraction
     stats     = get_word_stats(raw_text)
     keywords  = get_top_keywords(cleaned)
     return {
@@ -219,7 +253,120 @@ def analyze_resume(raw_text, file_name):
     }
 
 # ============================================================
-# NEW: Helper — Convert results list to CSV bytes
+# Category-Specific Skill Criteria
+# Each job category has its own required and bonus skills
+# ============================================================
+# ============================================================
+# Category-Specific Skill Criteria (Expanded)
+# Each category has required + bonus skills list
+# ============================================================
+CATEGORY_SKILLS = {
+    "SQL Developer": {
+        "required": ["SQL", "MySQL", "Oracle", "MongoDB", "PostgreSQL",
+                     "Database", "Query", "Stored Procedure", "NoSQL", "SSMS"],
+        "bonus"   : ["Python", "Power BI", "Tableau", "Excel", "Azure",
+                     "AWS", "Linux", "Git", "ETL", "Data Warehouse", "Agile"],
+    },
+    "React Developer": {
+        "required": ["React", "JavaScript", "HTML", "CSS", "Node",
+                     "Redux", "TypeScript", "REST API", "JSON", "npm"],
+        "bonus"   : ["Git", "Docker", "AWS", "Azure", "Python",
+                     "Agile", "Scrum", "Jest", "Webpack", "Bootstrap"],
+    },
+    "Workday": {
+        "required": ["Workday", "HCM", "HRIS", "Payroll", "ERP",
+                     "Business Process", "Workday Studio", "Integration", "BIRT", "Absence"],
+        "bonus"   : ["SAP", "Oracle", "PeopleSoft", "Excel", "SQL",
+                     "Python", "Agile", "Reporting", "Compensation", "Recruiting"],
+    },
+    "Peoplesoft": {
+        "required": ["PeopleSoft", "PeopleCode", "Application Engine", "SQR", "Component Interface",
+                     "HCM", "FSCM", "ERP", "Integration Broker", "PeopleSoft Query"],
+        "bonus"   : ["Oracle", "SQL", "Workday", "SAP", "Excel",
+                     "Python", "Agile", "COBOL", "Unix", "Reporting"],
+    },
+}
+
+# ============================================================
+# Resume Scoring & Ranking Function (Category-Based)
+# Score is calculated out of 100:
+#   - Required Skills : up to 50 pts — percentage of required skills matched * 50
+#   - Bonus Skills    : up to 20 pts — percentage of bonus skills matched * 20
+#   - Experience      : up to 15 pts (3 pts per year, max 5 yrs)
+#   - Education       : up to 10 pts (based on degree level)
+#   - Contact Info    : up to  5 pts (email 3pts + phone 2pts)
+# ============================================================
+def calculate_score(result):
+    category = result["category"]
+    # Use both raw text fields for better skill matching
+    raw_text = (result.get("cleaned", "") + " " +
+                result.get("education", "") + " " +
+                " ".join(result.get("skills", [])))
+    criteria = CATEGORY_SKILLS.get(category, {
+        "required": ["Python", "SQL", "Git"],
+        "bonus"   : ["Excel", "Agile", "Docker"]
+    })
+
+    # --- Required Skills Score (max 50) ---
+    # Score = (matched / total_required) * 50
+    matched_required = [s for s in criteria["required"] if re.search(s, raw_text, re.IGNORECASE)]
+    total_req = len(criteria["required"])
+    req_score = round((len(matched_required) / total_req) * 50) if total_req > 0 else 0
+
+    # --- Bonus Skills Score (max 20) ---
+    # Score = (matched / total_bonus) * 20
+    matched_bonus = [s for s in criteria["bonus"] if re.search(s, raw_text, re.IGNORECASE)]
+    total_bonus = len(criteria["bonus"])
+    bonus_score = round((len(matched_bonus) / total_bonus) * 20) if total_bonus > 0 else 0
+
+    skill_score = req_score + bonus_score
+
+    # --- Experience Score (max 15) ---
+    exp = result["experience"]
+    exp_score = 0
+    if exp != "Not Mentioned":
+        m = re.search(r'(\d+)', exp)
+        if m:
+            years = int(m.group(1))
+            exp_score = min(years * 3, 15)
+
+    # --- Education Score (max 10) ---
+    edu = result["education"].lower()
+    edu_score = 0
+    if any(d in edu for d in ['phd', 'doctorate']):
+        edu_score = 10
+    elif any(d in edu for d in ['m.tech', 'm.sc', 'mca', 'mba', 'm.e', 'm.com', 'master']):
+        edu_score = 8
+    elif any(d in edu for d in ['b.tech', 'b.sc', 'bca', 'b.e', 'b.com', 'bachelor']):
+        edu_score = 6
+    elif edu != "not found":
+        edu_score = 4
+
+    # --- Contact Info Score (max 5) ---
+    contact_score = 0
+    if result["email"] != "Not Found":
+        contact_score += 3
+    if result["phone"] != "Not Found":
+        contact_score += 2
+
+    total = min(req_score + bonus_score + exp_score + edu_score + contact_score, 100)
+    return total, skill_score, matched_required, matched_bonus, exp_score, edu_score, contact_score
+
+def get_grade(score):
+    # Assign letter grade based on total score out of 100
+    if score >= 75:
+        return "🥇 A+"
+    elif score >= 60:
+        return "🥈 A"
+    elif score >= 45:
+        return "🥉 B+"
+    elif score >= 30:
+        return "📄 B"
+    else:
+        return "📋 C"
+
+# ============================================================
+# Helper — Convert results list to CSV bytes
 # ============================================================
 def results_to_csv(results_list):
     rows = []
@@ -372,62 +519,241 @@ with tab1:
 
 
 # ================================================================
-# Tab 2: NEW — Bulk Resume Upload
+# Helper: extract files from ZIP
+# ================================================================
+def extract_files_from_zip(zip_file):
+    """
+    Extract PDF, DOCX, TXT files from a ZIP archive.
+    Handles nested folders at any depth.
+    Returns (extracted_list, skipped_list).
+    Each extracted item is a BytesIO with .name (filename) and .path (full ZIP path).
+    """
+    extracted = []
+    skipped   = []
+
+    with zipfile.ZipFile(zip_file, 'r') as z:
+        for name in z.namelist():
+            base = name.split('/')[-1]
+            # Skip folders and system/hidden files
+            if name.endswith('/') or base.startswith('__') or base.startswith('.') or base == '':
+                continue
+            ext = base.lower().rsplit('.', 1)[-1] if '.' in base else ''
+            if ext in ['pdf', 'docx', 'txt']:
+                data     = z.read(name)
+                buf      = io.BytesIO(data)
+                buf.name = base    # filename only — used by get_text_from_file
+                buf.path = name    # full path inside ZIP — shown in UI
+                extracted.append(buf)
+            else:
+                if ext:
+                    skipped.append(name)
+
+    return extracted, skipped
+
+# ================================================================
+# Tab 2: Bulk Resume Upload (Files + ZIP + Category Filter)
 # ================================================================
 with tab2:
     st.subheader("📦 Bulk Resume Upload")
-    st.info("Upload multiple resumes at once — all results will appear in a single table.")
+    st.info("Upload multiple resumes (PDF/DOCX/TXT) or a ZIP file/folder archive — all results appear in a ranked table.")
 
-    bulk_files = st.file_uploader(
-        "Upload multiple resumes (PDF, DOCX, TXT)",
-        type=['pdf', 'docx', 'txt'],
-        accept_multiple_files=True,
-        key="bulk_uploader"
+    upload_mode = st.radio(
+        "Select upload type:",
+        ["📄 Individual Files", "🗜️ ZIP File / Folder Archive"],
+        horizontal=True
     )
 
-    if bulk_files:
+    bulk_files_raw = []
+
+    if upload_mode == "📄 Individual Files":
+        uploaded_bulk = st.file_uploader(
+            "Upload multiple resumes (PDF, DOCX, TXT)",
+            type=['pdf', 'docx', 'txt'],
+            accept_multiple_files=True,
+            key="bulk_uploader"
+        )
+        if uploaded_bulk:
+            bulk_files_raw = uploaded_bulk
+
+    else:
+        zip_file = st.file_uploader(
+            "Upload a ZIP file containing resumes",
+            type=['zip'],
+            key="zip_uploader"
+        )
+        if zip_file:
+            try:
+                extracted, skipped = extract_files_from_zip(zip_file)
+                if extracted:
+                    st.success(f"✅ Found **{len(extracted)}** resume(s) in ZIP (including nested folders)")
+
+                    # Show folder tree structure
+                    with st.expander("📂 View ZIP Contents (folder structure)", expanded=True):
+                        # Group files by their folder path
+                        folder_map = {}
+                        for f in extracted:
+                            parts = f.path.split('/')
+                            folder = '/'.join(parts[:-1]) if len(parts) > 1 else '(root)'
+                            folder_map.setdefault(folder, []).append(f.name)
+
+                        for folder, files in folder_map.items():
+                            st.markdown(f"**📁 {folder}**")
+                            for fname in files:
+                                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;📄 {fname}")
+
+                        if skipped:
+                            st.caption(f"⚠️ Skipped {len(skipped)} unsupported file(s): " +
+                                       ", ".join(skipped[:5]) + ("..." if len(skipped) > 5 else ""))
+
+                    bulk_files_raw = extracted
+                else:
+                    st.warning("No PDF, DOCX, or TXT files found inside the ZIP.")
+                    if skipped:
+                        st.caption(f"Found these unsupported files: {', '.join(skipped[:10])}")
+            except Exception as e:
+                st.error(f"Could not read ZIP file: {e}")
+
+    # --- Category Filter for Ranking ---
+    if bulk_files_raw:
+        st.divider()
+        filter_col1, filter_col2 = st.columns([2, 1])
+        with filter_col1:
+            selected_categories = st.multiselect(
+                "🔍 Filter ranking by category (leave empty = show all):",
+                options=["SQL Developer", "React Developer", "Workday", "Peoplesoft"],
+                default=[],
+                help="Select one or more categories to compare only those resumes against each other"
+            )
+        with filter_col2:
+            st.write("")
+            st.write("")
+            analyze_btn = st.button("🚀 Analyze All Resumes", use_container_width=True)
+
         if model is None:
             st.warning("Models are not loaded properly. Check your 'models' folder.")
-        else:
-            if st.button("🚀 Analyze All Resumes"):
-                new_results = []
-                progress_bar = st.progress(0)
-                status_text  = st.empty()
+        elif analyze_btn:
+            new_results = []
+            progress_bar = st.progress(0)
+            status_text  = st.empty()
 
-                for i, file in enumerate(bulk_files):
-                    status_text.text(f"Analyzing: {file.name} ({i+1}/{len(bulk_files)})")
-                    try:
-                        raw_text = get_text_from_file(file)
-                        result   = analyze_resume(raw_text, file.name)
-                        new_results.append(result)
-                        st.session_state.bulk_results.append(result)
-                        st.session_state.history.append({
-                            "file_name": file.name,
-                            "category" : result["category"],
-                            "timestamp": result["timestamp"]
+            for i, file in enumerate(bulk_files_raw):
+                # Use full ZIP path (folder/file.pdf) if available, else just filename
+                display_name = getattr(file, 'path', file.name)
+                status_text.text(f"Analyzing: {file.name} ({i+1}/{len(bulk_files_raw)})")
+                try:
+                    raw_text = get_text_from_file(file)
+                    result   = analyze_resume(raw_text, display_name)
+                    new_results.append(result)
+                    st.session_state.bulk_results.append(result)
+                    st.session_state.history.append({
+                        "file_name": display_name,
+                        "category" : result["category"],
+                        "timestamp": result["timestamp"]
+                    })
+                except Exception as e:
+                    st.error(f"Error processing {file.name}: {e}")
+                progress_bar.progress((i + 1) / len(bulk_files_raw))
+
+            status_text.success(f"✅ {len(new_results)} resumes analyzed successfully!")
+
+
+            # Show quick results table + ranking
+            if new_results:
+                st.subheader("📋 Bulk Analysis Results")
+                rows = []
+                for r in new_results:
+                    rows.append({
+                        "File"      : r["file_name"],
+                        "Name"      : r["name"],
+                        "Category"  : r["category"],
+                        "Email"     : r["email"],
+                        "Phone"     : r["phone"],
+                        "Experience": r["experience"],
+                        "Education" : r["education"],
+                        "Skills"    : ", ".join(r["skills"][:5]) + ("..." if len(r["skills"]) > 5 else ""),
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                st.divider()
+
+                # --- Apply category filter for ranking ---
+                if selected_categories:
+                    rank_results = [r for r in new_results if r["category"] in selected_categories]
+                    st.info(f"🔍 Ranking filtered for: **{', '.join(selected_categories)}** — {len(rank_results)} candidate(s)")
+                else:
+                    rank_results = new_results
+                    st.info(f"📋 Showing ranking for all {len(rank_results)} candidates across all categories.")
+
+                if not rank_results:
+                    st.warning("No resumes matched the selected categories.")
+                else:
+                    st.subheader("🏆 Candidate Ranking")
+                    st.caption("Ranked by: Required Skills (50pts) + Bonus Skills (20pts) + Experience (15pts) + Education (10pts) + Contact (5pts) = 100pts")
+
+                    ranking_rows = []
+                    for r in rank_results:
+                        total_score, skill_score, matched_req, matched_bonus, exp_score, edu_score, contact_score = calculate_score(r)
+                        ranking_rows.append({
+                            "_score"           : total_score,
+                            "Name"             : r["name"],
+                            "File"             : r["file_name"],
+                            "Category"         : r["category"],
+                            "Grade"            : get_grade(total_score),
+                            "Required Skills"  : ", ".join(matched_req) if matched_req else "None",
+                            "Bonus Skills"     : ", ".join(matched_bonus) if matched_bonus else "None",
+                            "Skills pts"       : f"{skill_score} / 70",
+                            "Experience pts"   : f"{exp_score} / 15",
+                            "Education pts"    : f"{edu_score} / 10",
+                            "Contact pts"      : f"{contact_score} / 5",
                         })
-                    except Exception as e:
-                        st.error(f"Error processing {file.name}: {e}")
-                    progress_bar.progress((i + 1) / len(bulk_files))
 
-                status_text.success(f"✅ {len(new_results)} resumes analyzed successfully!")
+                    ranking_rows.sort(key=lambda x: x["_score"], reverse=True)
 
-                # Show quick results table
-                if new_results:
-                    st.subheader("📋 Bulk Analysis Results")
-                    rows = []
-                    for r in new_results:
-                        rows.append({
-                            "File"      : r["file_name"],
-                            "Name"      : r["name"],
-                            "Category"  : r["category"],
-                            "Email"     : r["email"],
-                            "Phone"     : r["phone"],
-                            "Experience": r["experience"],
-                            "Education" : r["education"],
-                            "Skills"    : ", ".join(r["skills"][:5]) + ("..." if len(r["skills"]) > 5 else ""),
-                        })
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    for i, row in enumerate(ranking_rows, 1):
+                        row["Rank"]        = i
+                        row["Score / 100"] = row["_score"]
+                        del row["_score"]
+
+                    df_rank = pd.DataFrame(ranking_rows)[[
+                        "Rank", "Name", "File", "Category", "Grade",
+                        "Score / 100", "Required Skills", "Bonus Skills",
+                        "Skills pts", "Experience pts", "Education pts", "Contact pts"
+                    ]]
+                    st.dataframe(df_rank, use_container_width=True)
+
+                    # Top 3 candidates
+                    if len(ranking_rows) >= 1:
+                        st.divider()
+                        st.subheader("🎖️ Top Candidates")
+                        medals = ["🥇", "🥈", "🥉"]
+                        top_n = min(3, len(ranking_rows))
+                        cols = st.columns(top_n)
+                        for i in range(top_n):
+                            r = ranking_rows[i]
+                            cols[i].metric(
+                                label=f"{medals[i]} Rank {i+1}",
+                                value=r["Name"],
+                                delta=f"{r['Score / 100']} / 100  |  {r['Grade']}"
+                            )
+
+                    # Score bar chart
+                    st.divider()
+                    st.subheader("📊 Score Comparison")
+                    names  = [r["Name"] if r["Name"] != "Not Found" else r["File"] for r in ranking_rows]
+                    scores = [r["Score / 100"] for r in ranking_rows]
+                    colors = ['#7c3aed' if i == 0 else '#a78bfa' if i == 1 else '#c4b5fd' if i == 2 else '#ede9fe' for i in range(len(scores))]
+                    fig_rank, ax_rank = plt.subplots(figsize=(10, max(4, len(names) * 0.7)))
+                    bars = ax_rank.barh(names[::-1], scores[::-1], color=colors[::-1])
+                    ax_rank.set_xlabel("Score (out of 100)")
+                    ax_rank.set_title("Candidate Score Ranking")
+                    ax_rank.set_xlim(0, 100)
+                    ax_rank.set_facecolor("#f5f3ff")
+                    fig_rank.patch.set_facecolor("#f5f3ff")
+                    for bar, score in zip(bars, scores[::-1]):
+                        ax_rank.text(bar.get_width() + 1, bar.get_y() + bar.get_height()/2,
+                                     f'{score}', va='center', fontweight='bold', color='#7c3aed')
+                    plt.tight_layout()
+                    st.pyplot(fig_rank)
+                    st.divider()
 
                     # Category distribution chart
                     st.subheader("📊 Category Distribution")
@@ -452,7 +778,6 @@ with tab2:
                     )
 
 
-# ================================================================
 # Tab 3: NEW — Summary Table (all analyzed so far)
 # ================================================================
 with tab3:
